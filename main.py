@@ -13,7 +13,7 @@ import yt_dlp
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("8928986664:AAFMa345k54fU_Z8wNC8mY0vWSn8NMTg6iw")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found")
 
