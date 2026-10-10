@@ -148,9 +148,15 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Download error")
         await status_msg.edit_text(f"❌ خطا در دانلود:\n{str(e)[:300]}")
-
-
+        
 def main():
+    # رفع مشکل Python 3.14
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
