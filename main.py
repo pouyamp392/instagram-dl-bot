@@ -1,13 +1,18 @@
-import asyncio
 import os
 import logging
+import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart
-from aiogram.enums import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 from dotenv import load_dotenv
 import yt_dlp
 
@@ -15,15 +20,14 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not found")
+    raise ValueError("BOT_TOKEN not found in environment variables")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# کیفیت‌های قابل انتخاب
 QUALITIES = {
     "best": "بهترین کیفیت",
     "720": "۷۲۰p",
@@ -31,48 +35,52 @@ QUALITIES = {
     "audio": "فقط صدا (MP3)"
 }
 
+
 def is_instagram_url(text: str) -> bool:
-    return "instagram.com" in text.lower() or "instagr.am" in text.lower()
+    text = text.lower()
+    return "instagram.com" in text or "instagr.am" in text
+
 
 def get_quality_keyboard(url: str) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=title, callback_data=f"dl|{key}|{url}")]
         for key, title in QUALITIES.items()
     ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(buttons)
 
-@dp.message(CommandStart())
-async def start_handler(message: Message):
-    await message.answer(
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         "سلام 👋\n"
         "لینک ریلز یا پست اینستاگرام رو بفرست تا برات دانلود کنم.\n\n"
         "بعد از ارسال لینک، کیفیت مورد نظرت رو انتخاب کن."
     )
 
-@dp.message(F.text)
-async def url_handler(message: Message):
-    url = message.text.strip()
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
 
     if not is_instagram_url(url):
-        await message.answer("لطفاً فقط لینک معتبر اینستاگرام بفرست.")
+        await update.message.reply_text("لطفاً فقط لینک معتبر اینستاگرام بفرست.")
         return
 
-    await message.answer(
+    await update.message.reply_text(
         "لینک دریافت شد ✅\nکیفیت مورد نظرت رو انتخاب کن:",
         reply_markup=get_quality_keyboard(url)
     )
 
-@dp.callback_query(F.data.startswith("dl|"))
-async def download_handler(callback: CallbackQuery):
-    await callback.answer()
+
+async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
     try:
-        _, quality, url = callback.data.split("|", 2)
+        _, quality, url = query.data.split("|", 2)
     except ValueError:
-        await callback.message.answer("خطا در پردازش درخواست.")
+        await query.message.reply_text("خطا در پردازش درخواست.")
         return
 
-    status_msg = await callback.message.answer("در حال آماده‌سازی دانلود... ⏳")
+    status_msg = await query.message.reply_text("در حال آماده‌سازی دانلود... ⏳")
 
     try:
         with TemporaryDirectory() as tmpdir:
@@ -105,40 +113,53 @@ async def download_handler(callback: CallbackQuery):
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
 
-                # اگر صدا استخراج شده باشه، پسوند عوض می‌شه
                 if quality == "audio":
                     filename = str(Path(filename).with_suffix(".mp3"))
 
             if not Path(filename).exists():
-                # گاهی اسم فایل کمی فرق می‌کنه
                 files = list(Path(tmpdir).glob("*"))
                 if not files:
                     raise FileNotFoundError("فایل دانلود نشد")
                 filename = str(files[0])
 
             file_size = Path(filename).stat().st_size
-            if file_size > 49 * 1024 * 1024:  # محدودیت تقریبی تلگرام
+            if file_size > 49 * 1024 * 1024:
                 await status_msg.edit_text("حجم فایل بیشتر از حد مجاز تلگرام است (حدود ۵۰ مگابایت).")
                 return
 
             await status_msg.edit_text("در حال ارسال فایل... 📤")
 
-            media = FSInputFile(filename)
-
-            if quality == "audio":
-                await callback.message.answer_audio(media, caption="✅ دانلود انجام شد")
-            else:
-                await callback.message.answer_video(media, caption="✅ دانلود انجام شد")
+            with open(filename, "rb") as f:
+                if quality == "audio":
+                    await context.bot.send_audio(
+                        chat_id=query.message.chat_id,
+                        audio=f,
+                        caption="✅ دانلود انجام شد"
+                    )
+                else:
+                    await context.bot.send_video(
+                        chat_id=query.message.chat_id,
+                        video=f,
+                        caption="✅ دانلود انجام شد"
+                    )
 
             await status_msg.delete()
 
     except Exception as e:
         logger.exception("Download error")
-        await status_msg.edit_text(f"❌ خطا در دانلود:\n`{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN)
+        await status_msg.edit_text(f"❌ خطا در دانلود:\n{str(e)[:300]}")
 
-async def main():
-    logger.info("Bot started")
-    await dp.start_polling(bot)
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl\|"))
+
+    logger.info("Bot is starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
