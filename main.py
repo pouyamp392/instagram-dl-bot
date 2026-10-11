@@ -11,6 +11,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -29,6 +30,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+QUALITIES = {
+    "best": "بهترین کیفیت",
+    "720": "۷۲۰p",
+    "480": "۴۸۰p",
+    "audio": "فقط صدا (MP3)"
+}
+
 
 # ==================== سرور سلامت برای Render ====================
 class HealthHandler(BaseHTTPRequestHandler):
@@ -39,6 +47,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive")
 
     def log_message(self, format, *args):
+        # لاگ‌های اضافی سرور رو خاموش می‌کنیم
         pass
 
 
@@ -55,18 +64,19 @@ def is_instagram_url(text: str) -> bool:
     return "instagram.com" in text or "instagr.am" in text
 
 
-def get_bot_button() -> InlineKeyboardMarkup:
-    button = InlineKeyboardButton(
-        text="رفت به ربات",
-        url="https://t.me/mewInstaBot"
-    )
-    return InlineKeyboardMarkup([[button]])
+def get_quality_keyboard(url: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=title, callback_data=f"dl|{key}|{url}")]
+        for key, title in QUALITIES.items()
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "سلام 👋\n"
-        "لینک ریلز یا پست اینستاگرام رو بفرست تا برات دانلود کنم."
+        "لینک ریلز یا پست اینستاگرام رو بفرست تا برات دانلود کنم.\n\n"
+        "بعد از ارسال لینک، کیفیت مورد نظرت رو انتخاب کن."
     )
 
 
@@ -77,7 +87,23 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("لطفاً فقط لینک معتبر اینستاگرام بفرست.")
         return
 
-    status_msg = await update.message.reply_text("در حال دانلود... ⏳")
+    await update.message.reply_text(
+        "لینک دریافت شد ✅\nکیفیت مورد نظرت رو انتخاب کن:",
+        reply_markup=get_quality_keyboard(url)
+    )
+
+
+async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, quality, url = query.data.split("|", 2)
+    except ValueError:
+        await query.message.reply_text("خطا در پردازش درخواست.")
+        return
+
+    status_msg = await query.message.reply_text("در حال آماده‌سازی دانلود... ⏳")
 
     try:
         with TemporaryDirectory() as tmpdir:
@@ -88,13 +114,30 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,
-                # کیفیت پیش‌فرض: ۴۸۰p
-                "format": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best",
             }
+
+            if quality == "audio":
+                ydl_opts.update({
+                    "format": "bestaudio/best",
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }],
+                })
+            elif quality == "best":
+                ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            elif quality == "720":
+                ydl_opts["format"] = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+            elif quality == "480":
+                ydl_opts["format"] = "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
+
+                if quality == "audio":
+                    filename = str(Path(filename).with_suffix(".mp3"))
 
             if not Path(filename).exists():
                 files = list(Path(tmpdir).glob("*"))
@@ -104,21 +147,24 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             file_size = Path(filename).stat().st_size
             if file_size > 49 * 1024 * 1024:
-                await status_msg.edit_text("حجم فایل بیشتر از حد مجاز تلگرام است.")
+                await status_msg.edit_text("حجم فایل بیشتر از حد مجاز تلگرام است (حدود ۵۰ مگابایت).")
                 return
 
-            await status_msg.edit_text("در حال ارسال... 📤")
-
-            caption = "دانلود توسط ربات mewInstaBot انجام شد"
-            reply_markup = get_bot_button()
+            await status_msg.edit_text("در حال ارسال فایل... 📤")
 
             with open(filename, "rb") as f:
-                await context.bot.send_video(
-                    chat_id=update.message.chat_id,
-                    video=f,
-                    caption=caption,
-                    reply_markup=reply_markup
-                )
+                if quality == "audio":
+                    await context.bot.send_audio(
+                        chat_id=query.message.chat_id,
+                        audio=f,
+                        caption="✅ دانلود انجام شد"
+                    )
+                else:
+                    await context.bot.send_video(
+                        chat_id=query.message.chat_id,
+                        video=f,
+                        caption="✅ دانلود انجام شد"
+                    )
 
             await status_msg.delete()
 
@@ -135,7 +181,7 @@ def main():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    # شروع سرور سلامت
+    # شروع سرور سلامت در پس‌زمینه (برای زنده موندن روی Render)
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
 
@@ -143,6 +189,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl\|"))
 
     logger.info("Bot is starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
