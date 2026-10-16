@@ -1,4 +1,3 @@
-
 import os
 import logging
 import asyncio
@@ -15,6 +14,8 @@ from telegram import (
     BotCommand,
     BotCommandScopeDefault,
     BotCommandScopeAllPrivateChats,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -54,7 +55,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# کاهش لاگ‌های اضافی درخواست‌های HTTP
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -85,7 +85,7 @@ def start_health_server():
 
 async def setup_bot_commands(app: Application):
     commands = [
-        BotCommand("start", "شروع و بررسی عضویت"),
+        BotCommand("start", "🚀 استارت"),
     ]
 
     await app.bot.set_my_commands(
@@ -99,6 +99,33 @@ async def setup_bot_commands(app: Application):
     )
 
     logger.info("Bot commands configured.")
+
+
+# ==================== کیبورد کنار (Reply Keyboard) ====================
+
+def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton("🚀 استارت")],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="لینک اینستاگرام را بفرست یا استارت بزن...",
+    )
+
+
+# ==================== منوی شیشه‌ای (Inline Keyboard) ====================
+
+def get_main_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🚀 استارت",
+                callback_data="menu:start",
+            )
+        ],
+    ])
 
 
 # ==================== دکمه رفتن به ربات ====================
@@ -161,11 +188,9 @@ async def check_membership(user_id: int):
             logger.error("Invalid missing channels list")
             return None, []
 
-        # فقط پاسخ صریح و معتبر اجازه عبور می‌دهد.
         if data.get("ok") is True and not missing:
             return True, []
 
-        # اگر سرور بررسی را تأیید نکرده، اجازه دانلود نمی‌دهیم.
         if data.get("ok") is not False:
             logger.error("Membership API returned an uncertain result")
             return None, []
@@ -304,8 +329,68 @@ async def start(
     await update.effective_message.reply_text(
         "سلام 👋 به ربات دانلود اینستاگرام خوش اومدی!\n\n"
         "📥 لینک ریلز یا پست اینستاگرام رو بفرست.\n"
-        "من ویدیو رو برات دانلود و ارسال می‌کنم. 🚀"
+        "من ویدیو رو برات دانلود و ارسال می‌کنم. 🚀",
+        reply_markup=get_main_reply_keyboard(),
     )
+
+    # منوی شیشه‌ای (جای کیبورد)
+    await update.effective_message.reply_text(
+        "👇 از دکمه زیر هم می‌تونی استفاده کنی:",
+        reply_markup=get_main_inline_keyboard(),
+    )
+
+
+# ==================== هندلر دکمه استارت از کیبورد پایین ====================
+
+async def handle_reply_keyboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    if message.text.strip() == "🚀 استارت":
+        await start(update, context)
+
+
+# ==================== هندلر دکمه‌های شیشه‌ای منو ====================
+
+async def menu_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+
+    if query.data == "menu:start":
+        # بررسی عضویت
+        allowed, missing = await check_membership(query.from_user.id)
+
+        if allowed is True:
+            await query.message.reply_text(
+                "سلام 👋 به ربات دانلود اینستاگرام خوش اومدی!\n\n"
+                "📥 لینک ریلز یا پست اینستاگرام رو بفرست.\n"
+                "من ویدیو رو برات دانلود و ارسال می‌کنم. 🚀",
+                reply_markup=get_main_reply_keyboard(),
+            )
+            return
+
+        if allowed is None:
+            await query.answer(
+                "بررسی عضویت ناموفق بود؛ کمی بعد دوباره تلاش کن.",
+                show_alert=True,
+            )
+            return
+
+        await query.message.reply_text(
+            "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو.\n\n"
+            "بعد از عضویت، روی دکمه «عضو شدم، بررسی مجدد» بزن.",
+            reply_markup=membership_markup(missing),
+        )
 
 
 # ==================== دریافت و دانلود لینک ====================
@@ -319,7 +404,6 @@ async def handle_url(
     if not message or not message.text:
         return
 
-    # قبل از هر دانلود، عضویت دوباره بررسی می‌شود.
     if not await require_membership(update, context):
         return
 
@@ -354,9 +438,6 @@ async def handle_url(
                 ),
             }
 
-            # yt-dlp عملیات دانلود را به‌صورت همگام انجام می‌دهد.
-            # اجرای آن در thread باعث می‌شود ربات هنگام دانلود
-            # کمتر در پاسخ‌گویی به کاربران دیگر متوقف شود.
             def download_video():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(
@@ -459,6 +540,21 @@ def main():
         CallbackQueryHandler(
             recheck_membership,
             pattern=r"^join:check$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            menu_callback,
+            pattern=r"^menu:",
+        )
+    )
+
+    # هندلر دکمه استارت از کیبورد پایین (قبل از handle_url)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(r"^🚀 استارت$"),
+            handle_reply_keyboard,
         )
     )
 
