@@ -12,6 +12,9 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
 )
 from telegram.ext import (
     Application,
@@ -33,6 +36,9 @@ ADMIN_API_URL = os.getenv(
 ).strip().rstrip("/")
 API_KEY = os.getenv("API_KEY", "").strip()
 
+BOT_USERNAME = "MewInstaBot"
+BOT_LINK = f"https://t.me/{BOT_USERNAME}"
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found")
 
@@ -42,10 +48,15 @@ if not API_KEY:
 if not ADMIN_API_URL:
     raise ValueError("ADMIN_API_URL not found")
 
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+# کاهش لاگ‌های اضافی درخواست‌های HTTP
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +66,7 @@ logger = logging.getLogger(__name__)
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"Bot is alive")
 
@@ -70,27 +81,53 @@ def start_health_server():
     server.serve_forever()
 
 
-# ==================== بررسی جوین اجباری ====================
+# ==================== منوی دستورات تلگرام ====================
+
+async def setup_bot_commands(app: Application):
+    commands = [
+        BotCommand("start", "شروع و بررسی عضویت"),
+    ]
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeDefault(),
+    )
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+
+    logger.info("Bot commands configured.")
+
+
+# ==================== دکمه رفتن به ربات ====================
+
+def get_bot_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                text="🤖 رفتن به ربات",
+                url=BOT_LINK,
+            )
+        ]
+    ])
+
+
+# ==================== بررسی عضویت اجباری ====================
 
 async def check_membership(user_id: int):
     """
     خروجی:
-    (True, [])           کاربر مجاز است
-    (False, missing)     کاربر باید عضو کانال‌ها شود
-    (None, [])           بررسی ناموفق بوده است
+    (True, [])      کاربر مجاز است
+    (False, list)   کاربر باید عضو کانال‌ها شود
+    (None, [])      بررسی عضویت ناموفق بوده است
     """
 
     url = f"{ADMIN_API_URL}/api/check"
-
-    headers = {
-        "X-API-Key": API_KEY,
-    }
-
-    params = {
-        "user_id": user_id,
-    }
-
-    timeout = aiohttp.ClientTimeout(total=15)
+    headers = {"X-API-Key": API_KEY}
+    params = {"user_id": user_id}
+    timeout = aiohttp.ClientTimeout(total=20)
 
     try:
         async with aiohttp.ClientSession(
@@ -111,17 +148,27 @@ async def check_membership(user_id: int):
 
                 data = await response.json()
 
-        if not data.get("enabled", True):
+        if not isinstance(data, dict):
+            logger.error("Invalid membership API response")
+            return None, []
+
+        if data.get("enabled") is False:
             return True, []
 
         missing = data.get("missing", [])
 
         if not isinstance(missing, list):
-            logger.error("Invalid membership API response")
+            logger.error("Invalid missing channels list")
             return None, []
 
+        # فقط پاسخ صریح و معتبر اجازه عبور می‌دهد.
         if data.get("ok") is True and not missing:
             return True, []
+
+        # اگر سرور بررسی را تأیید نکرده، اجازه دانلود نمی‌دهیم.
+        if data.get("ok") is not False:
+            logger.error("Membership API returned an uncertain result")
+            return None, []
 
         return False, missing
 
@@ -134,20 +181,25 @@ def membership_markup(missing: list) -> InlineKeyboardMarkup:
     rows = []
 
     for channel in missing:
+        if not isinstance(channel, dict):
+            continue
+
         link = channel.get("link")
         title = channel.get("title") or "کانال"
 
-        if link and isinstance(link, str):
+        if isinstance(link, str) and link.startswith(
+            ("https://", "http://")
+        ):
             rows.append([
                 InlineKeyboardButton(
-                    f"عضویت در {title[:45]}",
+                    text=f"عضویت در {title[:40]}",
                     url=link,
                 )
             ])
 
     rows.append([
         InlineKeyboardButton(
-            "✅ عضو شدم، بررسی مجدد",
+            text="✅ عضو شدم، بررسی مجدد",
             callback_data="join:check",
         )
     ])
@@ -159,6 +211,7 @@ async def require_membership(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
+
     user = update.effective_user
     message = update.effective_message
 
@@ -178,8 +231,8 @@ async def require_membership(
         return False
 
     await message.reply_text(
-        "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو.\n"
-        "بعد از عضویت روی «عضو شدم، بررسی مجدد» بزن.",
+        "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو.\n\n"
+        "بعد از عضویت، روی دکمه «عضو شدم، بررسی مجدد» بزن.",
         reply_markup=membership_markup(missing),
     )
 
@@ -191,6 +244,9 @@ async def recheck_membership(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
+    if not query:
+        return
 
     await query.answer()
 
@@ -205,11 +261,11 @@ async def recheck_membership(
         )
         return
 
-    if allowed:
+    if allowed is True:
         try:
             await query.edit_message_text(
-                "✅ عضویت تأیید شد!\n"
-                "حالا لینک اینستاگرام رو بفرست تا دانلود کنم."
+                "✅ عضویتت تأیید شد!\n\n"
+                "حالا لینک ریلز یا پست اینستاگرام رو بفرست."
             )
         except Exception:
             pass
@@ -217,7 +273,7 @@ async def recheck_membership(
 
     try:
         await query.edit_message_text(
-            "❌ هنوز عضویتت در همهٔ کانال‌های لازم تأیید نشده.\n"
+            "❌ هنوز عضویتت در همه کانال‌های لازم تأیید نشده.\n\n"
             "عضو شو و دوباره بررسی کن.",
             reply_markup=membership_markup(missing),
         )
@@ -225,25 +281,18 @@ async def recheck_membership(
         pass
 
 
-# ==================== توابع ربات ====================
+# ==================== تشخیص لینک اینستاگرام ====================
 
 def is_instagram_url(text: str) -> bool:
     text = text.lower()
 
     return (
-        "instagram.com" in text
-        or "instagr.am" in text
+        "instagram.com/" in text
+        or "instagr.am/" in text
     )
 
 
-def get_bot_button() -> InlineKeyboardMarkup:
-    button = InlineKeyboardButton(
-        text="رفتن به ربات",
-        url="https://t.me/mewInstaBot",
-    )
-
-    return InlineKeyboardMarkup([[button]])
-
+# ==================== دستور /start ====================
 
 async def start(
     update: Update,
@@ -253,11 +302,13 @@ async def start(
         return
 
     await update.effective_message.reply_text(
-        "سلام 👋\n"
-        "لینک ریلز یا پست اینستاگرام رو بفرست "
-        "تا برات دانلود کنم."
+        "سلام 👋 به ربات دانلود اینستاگرام خوش اومدی!\n\n"
+        "📥 لینک ریلز یا پست اینستاگرام رو بفرست.\n"
+        "من ویدیو رو برات دانلود و ارسال می‌کنم. 🚀"
     )
 
+
+# ==================== دریافت و دانلود لینک ====================
 
 async def handle_url(
     update: Update,
@@ -268,7 +319,7 @@ async def handle_url(
     if not message or not message.text:
         return
 
-    # قبل از هر دانلود، عضویت بررسی می‌شود.
+    # قبل از هر دانلود، عضویت دوباره بررسی می‌شود.
     if not await require_membership(update, context):
         return
 
@@ -276,18 +327,19 @@ async def handle_url(
 
     if not is_instagram_url(url):
         await message.reply_text(
-            "لطفاً فقط لینک معتبر اینستاگرام بفرست."
+            "🔗 لطفاً یک لینک معتبر از پست یا ریلز اینستاگرام بفرست."
         )
         return
 
     status_msg = await message.reply_text(
-        "در حال دانلود... ⏳"
+        "⏳ لینک دریافت شد!\n"
+        "در حال دانلود ویدیو..."
     )
 
     try:
         with TemporaryDirectory() as tmpdir:
             output_template = str(
-                Path(tmpdir) / "%(title).50s.%(ext)s"
+                Path(tmpdir) / "video.%(ext)s"
             )
 
             ydl_opts = {
@@ -302,47 +354,59 @@ async def handle_url(
                 ),
             }
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(
-                    url,
-                    download=True,
-                )
-                filename = ydl.prepare_filename(info)
+            # yt-dlp عملیات دانلود را به‌صورت همگام انجام می‌دهد.
+            # اجرای آن در thread باعث می‌شود ربات هنگام دانلود
+            # کمتر در پاسخ‌گویی به کاربران دیگر متوقف شود.
+            def download_video():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(
+                        url,
+                        download=True,
+                    )
+                    filename = ydl.prepare_filename(info)
+
+                if not Path(filename).exists():
+                    files = [
+                        p for p in Path(tmpdir).glob("*")
+                        if p.is_file()
+                    ]
+
+                    if not files:
+                        raise FileNotFoundError(
+                            "Downloaded file was not found"
+                        )
+
+                    filename = str(files[0])
+
+                return filename
+
+            filename = await asyncio.to_thread(download_video)
 
             if not Path(filename).exists():
-                files = list(Path(tmpdir).glob("*"))
-
-                if not files:
-                    raise FileNotFoundError(
-                        "فایل دانلود نشد"
-                    )
-
-                filename = str(files[0])
+                raise FileNotFoundError("Downloaded file not found")
 
             file_size = Path(filename).stat().st_size
 
             if file_size > 49 * 1024 * 1024:
                 await status_msg.edit_text(
-                    "حجم فایل بیشتر از حد مجاز تلگرام است."
+                    "❌ حجم ویدیو بیشتر از حد مجاز این ربات است."
                 )
                 return
 
             await status_msg.edit_text(
-                "در حال ارسال... 📤"
+                "📤 دانلود با موفقیت انجام شد!\n"
+                "در حال ارسال ویدیو..."
             )
 
-            caption = (
-                "دانلود توسط ربات mewInstaBot انجام شد"
-            )
+            caption = "✅ دانلود شده توسط ربات @MewInstaBot"
 
-            reply_markup = get_bot_button()
-
-            with open(filename, "rb") as file:
+            with open(filename, "rb") as video_file:
                 await context.bot.send_video(
                     chat_id=message.chat_id,
-                    video=file,
+                    video=video_file,
                     caption=caption,
-                    reply_markup=reply_markup,
+                    reply_markup=get_bot_button(),
+                    supports_streaming=True,
                 )
 
             await status_msg.delete()
@@ -352,13 +416,14 @@ async def handle_url(
 
         try:
             await status_msg.edit_text(
-                "❌ دانلود انجام نشد. لطفاً دوباره تلاش کن."
+                "❌ دانلود انجام نشد.\n"
+                "ممکنه لینک خصوصی یا نامعتبر باشه؛ لطفاً دوباره امتحان کن."
             )
         except Exception:
             pass
 
 
-# ==================== خطاها ====================
+# ==================== مدیریت خطاها ====================
 
 async def on_error(
     update: object,
@@ -373,13 +438,6 @@ async def on_error(
 # ==================== اجرای ربات ====================
 
 def main():
-    # سازگاری با بعضی محیط‌های پایتون
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
     health_thread = threading.Thread(
         target=start_health_server,
         daemon=True,
@@ -389,6 +447,7 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(setup_bot_commands)
         .build()
     )
 
