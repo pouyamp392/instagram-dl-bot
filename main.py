@@ -51,6 +51,21 @@ def run_web_server():
     port = int(os.environ.get("PORT", "10000"))
     web_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
 
+
+# ==================== دکمه شیشه‌ای «رفتن به ربات» ====================
+
+def get_bot_button() -> InlineKeyboardMarkup:
+    """دکمه شیشه‌ای برای رفتن به ربات — همراه کپشن ویدیو/عکس/فایل ارسال می‌شود."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                text="🤖 رفتن به ربات",
+                url=BOT_LINK,
+            )
+        ]
+    ])
+
+
 # Instagram URL helpers
 def extract_instagram_url(text: str):
     match = URL_PATTERN.search(text or "")
@@ -233,11 +248,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ext = file_path.suffix.lower()
             with file_path.open("rb") as media:
                 if ext in (".jpg", ".jpeg", ".png", ".webp"):
-                    await message.reply_photo(photo=media, caption="✅ دانلود با موفقیت انجام شد")
+                    # ✅ دکمه شیشه‌ای همراه کپشن عکس
+                    await message.reply_photo(
+                        photo=media,
+                        caption="✅ دانلود شده توسط ربات @MewInstaBot",
+                        reply_markup=get_bot_button(),
+                    )
                 elif ext in (".mp4", ".mov", ".m4v", ".webm"):
-                    await message.reply_video(video=media, caption="✅ دانلود با موفقیت انجام شد", supports_streaming=True, read_timeout=120, write_timeout=120, connect_timeout=30, pool_timeout=30)
+                    # ✅ دکمه شیشه‌ای همراه کپشن ویدیو
+                    await message.reply_video(
+                        video=media,
+                        caption="✅ دانلود شده توسط ربات @MewInstaBot",
+                        reply_markup=get_bot_button(),
+                        supports_streaming=True,
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
                 else:
-                    await message.reply_document(document=media, filename=file_path.name, caption="✅ دانلود با موفقیت انجام شد", read_timeout=120, write_timeout=120, connect_timeout=30)
+                    # ✅ دکمه شیشه‌ای همراه کپشن فایل
+                    await message.reply_document(
+                        document=media,
+                        filename=file_path.name,
+                        caption="✅ دانلود شده توسط ربات @MewInstaBot",
+                        reply_markup=get_bot_button(),
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=30,
+                    )
         try:
             await status.delete()
         except Exception:
