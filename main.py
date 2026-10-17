@@ -1,573 +1,271 @@
-import os
-import logging
 import asyncio
+import logging
+import os
+import re
+import shutil
+import tempfile
 import threading
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
-import aiohttp
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
-    BotCommandScopeDefault,
-    BotCommandScopeAllPrivateChats,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-from dotenv import load_dotenv
+import httpx
 import yt_dlp
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler,
+    ContextTypes, MessageHandler, filters,
+)
 
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_API_URL = os.getenv(
-    "ADMIN_API_URL",
-    "https://admin-dl-bot.onrender.com",
-).strip().rstrip("/")
-API_KEY = os.getenv("API_KEY", "").strip()
-
-BOT_USERNAME = "MewInstaBot"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_API_URL = os.getenv("ADMIN_API_URL", "https://admin-dl-bot.onrender.com").rstrip("/")
+API_KEY = os.getenv("API_KEY", "")
+GROUP_TRIGGER = "اینستا دانلودر"
+BOT_USERNAME = os.getenv("BOT_USERNAME", "MewInstaBot")
 BOT_LINK = f"https://t.me/{BOT_USERNAME}"
+MAX_FILE_SIZE = 49 * 1024 * 1024
+MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT", "2")))
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
+URL_PATTERN = re.compile(r"https?://[^\s<>]+")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not found")
+    raise ValueError("BOT_TOKEN environment variable is required")
 
-if not API_KEY:
-    raise ValueError("API_KEY not found")
-
-if not ADMIN_API_URL:
-    raise ValueError("ADMIN_API_URL not found")
-
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-logger = logging.getLogger(__name__)
+# Render health server
+web_app = Flask(__name__)
 
+@web_app.route("/")
+def home():
+    return "Instagram bot is running!", 200
 
-# ==================== سرور سلامت Render ====================
+@web_app.route("/health")
+def health():
+    return {"status": "ok"}, 200
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive")
+def run_web_server():
+    port = int(os.environ.get("PORT", "10000"))
+    web_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
 
-    def log_message(self, format, *args):
-        pass
-
-
-def start_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info("Health server started on port %s", port)
-    server.serve_forever()
-
-
-# ==================== منوی دستورات تلگرام ====================
-
-async def setup_bot_commands(app: Application):
-    commands = [
-        BotCommand("start", "🚀 استارت"),
-    ]
-
-    await app.bot.set_my_commands(
-        commands,
-        scope=BotCommandScopeDefault(),
-    )
-
-    await app.bot.set_my_commands(
-        commands,
-        scope=BotCommandScopeAllPrivateChats(),
-    )
-
-    logger.info("Bot commands configured.")
-
-
-# ==================== کیبورد کنار (Reply Keyboard) ====================
-
-def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
-        [KeyboardButton("🚀 استارت")],
-    ]
-    return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="لینک اینستاگرام را بفرست یا استارت بزن...",
-    )
-
-
-# ==================== منوی شیشه‌ای (Inline Keyboard) ====================
-
-def get_main_inline_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🚀 استارت",
-                callback_data="menu:start",
-            )
-        ],
-    ])
-
-
-# ==================== دکمه رفتن به ربات ====================
-
-def get_bot_button() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                text="🤖 رفتن به ربات",
-                url=BOT_LINK,
-            )
-        ]
-    ])
-
-
-# ==================== بررسی عضویت اجباری ====================
-
-async def check_membership(user_id: int):
-    """
-    خروجی:
-    (True, [])      کاربر مجاز است
-    (False, list)   کاربر باید عضو کانال‌ها شود
-    (None, [])      بررسی عضویت ناموفق بوده است
-    """
-
-    url = f"{ADMIN_API_URL}/api/check"
-    headers = {"X-API-Key": API_KEY}
-    params = {"user_id": user_id}
-    timeout = aiohttp.ClientTimeout(total=20)
-
+# Instagram URL helpers
+def extract_instagram_url(text: str):
+    match = URL_PATTERN.search(text or "")
+    if not match:
+        return None
+    url = match.group(0).rstrip(".,!?;:)]}\"'")
     try:
-        async with aiohttp.ClientSession(
-            timeout=timeout
-        ) as session:
-            async with session.get(
-                url,
-                headers=headers,
-                params=params,
-            ) as response:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https"):
+            return None
+        if host == "instagram.com" or host.endswith(".instagram.com"):
+            return url
+        if host == "instagr.am" or host.endswith(".instagr.am"):
+            return url
+    except ValueError:
+        return None
+    return None
 
-                if response.status != 200:
-                    logger.error(
-                        "Membership API returned HTTP %s",
-                        response.status,
-                    )
-                    return None, []
-
-                data = await response.json()
-
-        if not isinstance(data, dict):
-            logger.error("Invalid membership API response")
-            return None, []
-
+# Central mandatory-join API
+async def check_membership(user_id: int):
+    """Return (allowed, missing_channels). Fail closed if API/key is unavailable."""
+    if not API_KEY:
+        logger.error("API_KEY is missing; blocking request for safety")
+        return False, []
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            response = await client.get(
+                f"{ADMIN_API_URL}/api/check", params={"user_id": user_id},
+                headers={"X-API-Key": API_KEY},
+            )
+            response.raise_for_status()
+            data = response.json()
         if data.get("enabled") is False:
             return True, []
-
-        missing = data.get("missing", [])
-
-        if not isinstance(missing, list):
-            logger.error("Invalid missing channels list")
-            return None, []
-
-        if data.get("ok") is True and not missing:
-            return True, []
-
-        if data.get("ok") is not False:
-            logger.error("Membership API returned an uncertain result")
-            return None, []
-
-        return False, missing
-
+        missing = data.get("missing") or []
+        return bool(data.get("ok")) and not missing, missing
     except Exception:
-        logger.exception("Membership API request failed")
-        return None, []
+        logger.exception("Central membership API request failed")
+        return False, []
 
+def channel_field(channel, *keys):
+    if isinstance(channel, dict):
+        for key in keys:
+            value = channel.get(key)
+            if value:
+                return str(value)
+    elif channel:
+        return str(channel)
+    return ""
 
-def membership_markup(missing: list) -> InlineKeyboardMarkup:
+async def membership_markup(missing):
     rows = []
-
-    for channel in missing:
-        if not isinstance(channel, dict):
-            continue
-
-        link = channel.get("link")
-        title = channel.get("title") or "کانال"
-
-        if isinstance(link, str) and link.startswith(
-            ("https://", "http://")
-        ):
-            rows.append([
-                InlineKeyboardButton(
-                    text=f"عضویت در {title[:40]}",
-                    url=link,
+    channels = missing if all(isinstance(item, dict) for item in missing) else []
+    if missing and not channels:
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+                response = await client.get(
+                    f"{ADMIN_API_URL}/api/channels", headers={"X-API-Key": API_KEY}
                 )
-            ])
-
-    rows.append([
-        InlineKeyboardButton(
-            text="✅ عضو شدم، بررسی مجدد",
-            callback_data="join:check",
-        )
-    ])
-
+                response.raise_for_status()
+                payload = response.json()
+            all_channels = payload.get("channels", payload) if isinstance(payload, dict) else payload
+            if isinstance(all_channels, list):
+                wanted = {str(item).lstrip("@").lower() for item in missing}
+                channels = [ch for ch in all_channels if isinstance(ch, dict) and (
+                    str(ch.get("id", "")).lstrip("@").lower() in wanted
+                    or str(ch.get("username", "")).lstrip("@").lower() in wanted
+                    or str(ch.get("link", "")).lstrip("@").lower() in wanted
+                )]
+        except Exception:
+            logger.exception("Could not fetch channel details")
+    for channel in channels:
+        link = channel_field(channel, "link", "url", "invite_link")
+        title = channel_field(channel, "title", "name", "username") or "عضویت در کانال"
+        if link.startswith("@"):
+            link = f"https://t.me/{link[1:]}"
+        elif link and not link.startswith(("https://", "http://")):
+            link = f"https://t.me/{link.lstrip('/')}"
+        if link.startswith(("https://", "http://")):
+            rows.append([InlineKeyboardButton(f"عضویت در {title}", url=link)])
+    rows.append([InlineKeyboardButton("✅ بررسی عضویت", callback_data="join:check")])
     return InlineKeyboardMarkup(rows)
 
-
-async def require_membership(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> bool:
-
-    user = update.effective_user
-    message = update.effective_message
-
+async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user, message = update.effective_user, update.effective_message
     if not user or not message:
         return False
-
     allowed, missing = await check_membership(user.id)
-
-    if allowed is True:
+    if allowed:
         return True
-
-    if allowed is None:
-        await message.reply_text(
-            "⚠️ در حال حاضر امکان بررسی عضویت وجود ندارد.\n"
-            "لطفاً چند لحظه بعد دوباره تلاش کن."
-        )
-        return False
-
-    await message.reply_text(
-        "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو.\n\n"
-        "بعد از عضویت، روی دکمه «عضو شدم، بررسی مجدد» بزن.",
-        reply_markup=membership_markup(missing),
-    )
-
+    if missing:
+        text = "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو و سپس روی «بررسی عضویت» بزن."
+        markup = await membership_markup(missing)
+    else:
+        text = "⚠️ در حال حاضر امکان بررسی عضویت وجود ندارد. چند لحظه بعد دوباره امتحان کن."
+        markup = None
+    await message.reply_text(text, reply_markup=markup)
     return False
 
-
-async def recheck_membership(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-
-    if not query:
+# Commands and callbacks
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not await require_membership(update, context):
         return
-
-    await query.answer()
-
-    allowed, missing = await check_membership(
-        query.from_user.id
+    await update.message.reply_text(
+        "سلام! 👋\n\nلینک پست، ریلز یا ویدئوی عمومی اینستاگرام را بفرست تا دانلودش کنم.\n\n"
+        "در گروه هم می‌توانی عبارت «اینستا دانلودر» را بنویسی."
     )
 
-    if allowed is None:
-        await query.answer(
-            "بررسی ناموفق بود؛ کمی بعد دوباره تلاش کن.",
-            show_alert=True,
-        )
+async def recheck_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
         return
-
-    if allowed is True:
+    allowed, missing = await check_membership(query.from_user.id)
+    if allowed:
+        await query.answer("عضویت تأیید شد ✅")
         try:
-            await query.edit_message_text(
-                "✅ عضویتت تأیید شد!\n\n"
-                "حالا لینک ریلز یا پست اینستاگرام رو بفرست."
-            )
+            await query.edit_message_text("✅ عضویتت تأیید شد. حالا لینک اینستاگرام را بفرست.")
         except Exception:
             pass
+    else:
+        await query.answer("هنوز عضویت تأیید نشده است.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=await membership_markup(missing) if missing else None)
+        except Exception:
+            pass
+
+# One text handler supports private chats and groups
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not message or not message.text or not chat or not user:
         return
+    text = message.text.strip()
+    is_group = chat.type in ("group", "supergroup")
+    trigger_used = GROUP_TRIGGER.casefold() in text.casefold()
+    url = extract_instagram_url(text)
 
-    try:
-        await query.edit_message_text(
-            "❌ هنوز عضویتت در همه کانال‌های لازم تأیید نشده.\n\n"
-            "عضو شو و دوباره بررسی کن.",
-            reply_markup=membership_markup(missing),
-        )
-    except Exception:
-        pass
-
-
-# ==================== تشخیص لینک اینستاگرام ====================
-
-def is_instagram_url(text: str) -> bool:
-    text = text.lower()
-
-    return (
-        "instagram.com/" in text
-        or "instagr.am/" in text
-    )
-
-
-# ==================== دستور /start ====================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+    # In groups, ignore unrelated messages; react to the trigger or an Instagram URL.
+    if is_group and not trigger_used and not url:
+        return
     if not await require_membership(update, context):
         return
-
-    await update.effective_message.reply_text(
-        "سلام 👋 به ربات دانلود اینستاگرام خوش اومدی!\n\n"
-        "📥 لینک ریلز یا پست اینستاگرام رو بفرست.\n"
-        "من ویدیو رو برات دانلود و ارسال می‌کنم. 🚀",
-        reply_markup=get_main_reply_keyboard(),
-    )
-
-
-
-# ==================== هندلر دکمه استارت از کیبورد پایین ====================
-
-async def handle_reply_keyboard(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.effective_message
-    if not message or not message.text:
-        return
-
-    if message.text.strip() == "🚀 استارت":
-        await start(update, context)
-
-
-# ==================== هندلر دکمه‌های شیشه‌ای منو ====================
-
-async def menu_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    if not query:
-        return
-
-    await query.answer()
-
-    if query.data == "menu:start":
-        # بررسی عضویت
-        allowed, missing = await check_membership(query.from_user.id)
-
-        if allowed is True:
-            await query.message.reply_text(
-                "سلام 👋 به ربات دانلود اینستاگرام خوش اومدی!\n\n"
-                "📥 لینک ریلز یا پست اینستاگرام رو بفرست.\n"
-                "من ویدیو رو برات دانلود و ارسال می‌کنم. 🚀",
-                reply_markup=get_main_reply_keyboard(),
+    if not url:
+        if is_group and trigger_used:
+            await message.reply_text(
+                "📥 برای دانلود، لینک پست یا ریلز اینستاگرام را هم بفرست.\n"
+                "مثال: https://www.instagram.com/reel/..."
             )
-            return
-
-        if allowed is None:
-            await query.answer(
-                "بررسی عضویت ناموفق بود؛ کمی بعد دوباره تلاش کن.",
-                show_alert=True,
-            )
-            return
-
-        await query.message.reply_text(
-            "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو.\n\n"
-            "بعد از عضویت، روی دکمه «عضو شدم، بررسی مجدد» بزن.",
-            reply_markup=membership_markup(missing),
-        )
-
-
-# ==================== دریافت و دانلود لینک ====================
-
-async def handle_url(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.effective_message
-
-    if not message or not message.text:
+        elif not is_group:
+            await message.reply_text("لطفاً یک لینک معتبر از اینستاگرام بفرست.")
         return
 
-    if not await require_membership(update, context):
-        return
-
-    url = message.text.strip()
-
-    if not is_instagram_url(url):
-        await message.reply_text(
-            "🔗 لطفاً یک لینک معتبر از پست یا ریلز اینستاگرام بفرست."
-        )
-        return
-
-    status_msg = await message.reply_text(
-        "⏳ لینک دریافت شد!\n"
-        "در حال دانلود ویدیو..."
-    )
-
+    status = await message.reply_text("⏳ در حال دریافت محتوا از اینستاگرام...")
+    folder = tempfile.mkdtemp(prefix="instagram_")
     try:
-        with TemporaryDirectory() as tmpdir:
-            output_template = str(
-                Path(tmpdir) / "video.%(ext)s"
-            )
-
-            ydl_opts = {
-                "outtmpl": output_template,
+        async with DOWNLOAD_SEMAPHORE:
+            options = {
+                "outtmpl": str(Path(folder) / "%(id)s.%(ext)s"),
+                "format": "best[ext=mp4]/best",
+                "noplaylist": True,
+                "max_filesize": MAX_FILE_SIZE,
+                "socket_timeout": 30,
+                "retries": 2,
+                "fragment_retries": 2,
                 "quiet": True,
                 "no_warnings": True,
-                "noplaylist": True,
-                "format": (
-                    "bestvideo[height<=480][ext=mp4]"
-                    "+bestaudio[ext=m4a]/"
-                    "best[height<=480][ext=mp4]/best"
-                ),
+                "logger": logger,
             }
-
-            def download_video():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(
-                        url,
-                        download=True,
-                    )
-                    filename = ydl.prepare_filename(info)
-
-                if not Path(filename).exists():
-                    files = [
-                        p for p in Path(tmpdir).glob("*")
-                        if p.is_file()
-                    ]
-
-                    if not files:
-                        raise FileNotFoundError(
-                            "Downloaded file was not found"
-                        )
-
-                    filename = str(files[0])
-
-                return filename
-
-            filename = await asyncio.to_thread(download_video)
-
-            if not Path(filename).exists():
-                raise FileNotFoundError("Downloaded file not found")
-
-            file_size = Path(filename).stat().st_size
-
-            if file_size > 49 * 1024 * 1024:
-                await status_msg.edit_text(
-                    "❌ حجم ویدیو بیشتر از حد مجاز این ربات است."
-                )
+            def download():
+                with yt_dlp.YoutubeDL(options) as downloader:
+                    return downloader.extract_info(url, download=True)
+            await asyncio.to_thread(download)
+            files = [p for p in Path(folder).iterdir() if p.is_file() and not p.name.endswith((".part", ".ytdl")) and p.stat().st_size > 0]
+            if not files:
+                raise RuntimeError("No downloaded file was produced")
+            file_path = max(files, key=lambda p: p.stat().st_size)
+            if file_path.stat().st_size > MAX_FILE_SIZE:
+                await status.edit_text("❌ حجم فایل از سقف ارسال ربات (حدود ۴۹ مگابایت) بیشتر است.")
                 return
-
-            await status_msg.edit_text(
-                "📤 دانلود با موفقیت انجام شد!\n"
-                "در حال ارسال ویدیو..."
-            )
-
-            caption = "✅ دانلود شده توسط ربات @MewInstaBot"
-
-            with open(filename, "rb") as video_file:
-                await context.bot.send_video(
-                    chat_id=message.chat_id,
-                    video=video_file,
-                    caption=caption,
-                    reply_markup=get_bot_button(),
-                    supports_streaming=True,
-                )
-
-            await status_msg.delete()
-
-    except Exception:
-        logger.exception("Download error")
-
+            ext = file_path.suffix.lower()
+            with file_path.open("rb") as media:
+                if ext in (".jpg", ".jpeg", ".png", ".webp"):
+                    await message.reply_photo(photo=media, caption="✅ دانلود با موفقیت انجام شد")
+                elif ext in (".mp4", ".mov", ".m4v", ".webm"):
+                    await message.reply_video(video=media, caption="✅ دانلود با موفقیت انجام شد", supports_streaming=True, read_timeout=120, write_timeout=120, connect_timeout=30, pool_timeout=30)
+                else:
+                    await message.reply_document(document=media, filename=file_path.name, caption="✅ دانلود با موفقیت انجام شد", read_timeout=120, write_timeout=120, connect_timeout=30)
         try:
-            await status_msg.edit_text(
-                "❌ دانلود انجام نشد.\n"
-                "ممکنه لینک خصوصی یا نامعتبر باشه؛ لطفاً دوباره امتحان کن."
+            await status.delete()
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Instagram download failed")
+        try:
+            await status.edit_text(
+                "❌ دانلود انجام نشد. ممکن است پست خصوصی باشد، اینستاگرام دسترسی را محدود کرده باشد "
+                "یا yt-dlp نیاز به به‌روزرسانی داشته باشد."
             )
         except Exception:
             pass
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
-
-# ==================== مدیریت خطاها ====================
-
-async def on_error(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logger.error(
-        "Bot error: %s",
-        context.error,
-    )
-
-
-# ==================== اجرای ربات ====================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.warning("Bot error: %s", context.error)
 
 def main():
-    health_thread = threading.Thread(
-        target=start_health_server,
-        daemon=True,
-    )
-    health_thread.start()
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(setup_bot_commands)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            recheck_membership,
-            pattern=r"^join:check$",
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            menu_callback,
-            pattern=r"^menu:",
-        )
-    )
-
-    # هندلر دکمه استارت از کیبورد پایین (قبل از handle_url)
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.Regex(r"^🚀 استارت$"),
-            handle_reply_keyboard,
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_url,
-        )
-    )
-
-    app.add_error_handler(on_error)
-
+    threading.Thread(target=run_web_server, daemon=True).start()
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(recheck_membership, pattern=r"^join:check$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_error_handler(on_error)
     logger.info("Instagram bot is starting...")
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
